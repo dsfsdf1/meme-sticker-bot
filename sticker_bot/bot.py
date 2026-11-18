@@ -4,16 +4,19 @@ from pathlib import Path
 import logging
 
 from PIL import Image, UnidentifiedImageError
-from telegram import BotCommand, InlineKeyboardButton as Button, InlineKeyboardMarkup, InputFile, Update
+from telegram import BotCommand, BotCommandScopeAllGroupChats, InlineKeyboardButton as Button, InlineKeyboardMarkup, InputFile, Update
 from telegram.error import BadRequest, TelegramError
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
-from .albums import Albums
+from .albums import Album, Albums, prepare_frame
 from .images import CAPTION_LIMIT, COLORS, ImageError, cutout, render
 from .library import Library
 from .packs import DEFAULT_TITLE, MAX_TITLE, find_pack, new_pack_name, owned_packs, pack_name, pack_url, save_many, share_url
 from .proposals import Proposals
 from .photos import photo_bytes
+from .phrases import Phrases, chosen_phrase, show_variants
+from .groups import Groups
+from .videos import extract_moments, photo_bytes as encode_photo, video_bytes
 from .persistence import SavedDrafts
 from .state import Draft, Preferences, record_edit, restore_edit
 from .navigation import back_keyboard, color_keyboard, history_buttons, home_button, position_keyboard, refresh_options
@@ -27,12 +30,17 @@ class StickerBot:
         self.preferences = preferences
         self.drafts = SavedDrafts(preferences.path, "single")
         self.library = Library(preferences.path)
+        self.phrases = Phrases(preferences.path)
+        self.groups = Groups(self.library, preferences, self.phrases)
         self.albums = Albums(preferences, self.library, self.show_pack)
+        self.albums.show_single = self.show_preview
+        self.phrase_input = SavedDrafts(preferences.path, "phrase_input")
         self.proposals = Proposals(self.library, preferences)
         self.renaming = SavedDrafts(preferences.path, "renaming")
         self.naming = SavedDrafts(preferences.path, "naming")
 
     def cancel_input(self, user_id: int) -> None:
+        self.phrase_input.discard(user_id)
         self.renaming.discard(user_id)
         self.naming.discard(user_id)
         draft = self.drafts.get(user_id)
@@ -45,6 +53,22 @@ class StickerBot:
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         user_id = update.effective_user.id
         args = getattr(context, "args", None)
+        if args and args[0].startswith("chat_"):
+            if self.albums.sessions.get(user_id):
+                await update.effective_message.reply_text(
+                    "Сначала завершите или закройте свой альбом. Затем откройте ссылку из беседы ещё раз.",
+                    reply_markup=back_keyboard("album", "К альбому"),
+                )
+                return
+            draft = await self.groups.enter(update.effective_message, user_id, args[0][5:])
+            if draft is not None:
+                self.cancel_input(user_id)
+                self.proposals.cancel(user_id)
+                await self.show_preview(update.effective_message, user_id, draft, remember=False)
+                await show_variants(
+                    update.effective_message, draft, self.phrases, user_id, f"d:{draft.revision}:", f"d:{draft.revision}:back",
+                )
+            return
         if args and args[0].startswith("invite_"):
             await self.proposals.start(update.effective_message, user_id, args[0][7:])
             return
@@ -59,7 +83,9 @@ class StickerBot:
         keys = [
             [Button("Собрать стикерпак", callback_data="album")],
             [Button("Мои наборы", callback_data="pack"), Button("Настройки", callback_data="settings")],
+            [Button("Мои фразы", callback_data="phrases"), Button("Найти момент в видео", callback_data="video_help")],
             [Button("Предложения друзей", callback_data="inbox")],
+            [Button("Добавить в беседу", url=f"https://t.me/{context.bot.username}?startgroup=memes")],
         ]
         if album:
             keys.insert(0, [Button("Вернуться к альбому", callback_data="album")])
@@ -81,6 +107,10 @@ class StickerBot:
         self.renaming.discard(user_id)
         self.naming.discard(user_id)
         album = self.albums.sessions.get(user_id)
+        if self.phrase_input.get(user_id):
+            self.phrase_input.discard(user_id)
+            await self.phrase_menu(update, context)
+            return
         if album:
             if album.collecting:
                 await self.albums.collection_prompt(message, album)
@@ -123,7 +153,7 @@ class StickerBot:
 
         keys = [
             [button("Обводка", "colors"), button("Подпись", "captions")],
-            [button("Расположение текста", "layout")],
+            [button("Расположение текста", "layout"), button("Мои фразы", "phrases:0")],
             [button("Выбрать набор", "save")],
         ]
         history = history_buttons(f"d:{draft.revision}:", draft)
@@ -137,6 +167,7 @@ class StickerBot:
     async def photo(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         message = update.effective_message
         user_id = update.effective_user.id
+        self.phrase_input.discard(user_id)
         if await self.proposals.photo(message, user_id):
             return
         self.naming.discard(user_id)
@@ -155,10 +186,86 @@ class StickerBot:
             await status.edit_text("Не удалось открыть фото. Попробуйте другое.")
         else:
             await status.edit_text("Готово. Настройки стикера — под ним.")
+            draft = self.drafts.get(user_id)
+            if draft and self.phrases.list(user_id):
+                await show_variants(message, draft, self.phrases, user_id, f"d:{draft.revision}:", f"d:{draft.revision}:back")
+
+    async def video(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        message = update.effective_message
+        user_id = update.effective_user.id
+        if self.albums.sessions.get(user_id):
+            await message.reply_text(
+                "Сначала завершите или закройте текущий альбом.",
+                reply_markup=back_keyboard("album", "К альбому"),
+            )
+            return
+        if self.proposals.targets.get(user_id) is not None:
+            await message.reply_text("Для предложения в набор отправьте фото. /cancel — выйти из приглашения.")
+            return
+        status = await message.reply_text("Ищу чёткие и отличающиеся кадры…")
+        try:
+            moments = await asyncio.to_thread(extract_moments, await video_bytes(message))
+            frames = []
+            for moment in moments:
+                frame = await asyncio.to_thread(prepare_frame, encode_photo(moment.photo), self.preferences.color(user_id))
+                frame.seconds = moment.seconds
+                frames.append(frame)
+        except ImageError as error:
+            await status.edit_text(str(error))
+            return
+        self.cancel_input(user_id)
+        album = Album(frames=frames, collecting=False, from_video=True)
+        self.albums.sessions.put(user_id, album)
+        await self.albums.overview(message, album)
+        await status.edit_text(
+            "Кадры готовы. Выберите номер, затем «Выбрать этот кадр». Можно убрать лишние или сохранить несколько."
+        )
+
+    async def phrase_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        user_id = update.effective_user.id
+        self.cancel_input(user_id)
+        rows = self.phrases.list(user_id)
+        text = "\n".join(f"{index + 1}. {row['text']}" for index, row in enumerate(rows))
+        keys = [[Button("Добавить фразы", callback_data="f:add")]]
+        keys.extend([Button(f"Удалить · {row['text']}", callback_data=f"f:delete:{row['id']}")] for row in rows)
+        keys.append([Button("Назад к редактированию", callback_data="resume"), home_button()])
+        await update.effective_message.reply_text(
+            "Мои фразы · " + str(len(rows)) + "/10\n" + (text or "Сохраните фразы своей компании."),
+            reply_markup=InlineKeyboardMarkup(keys),
+        )
+
+    async def phrase_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        query = update.callback_query
+        message = update.effective_message
+        if message is None or message.chat.type != "private":
+            await query.answer()
+            return
+        await query.answer()
+        user_id = update.effective_user.id
+        if query.data == "f:add":
+            self.cancel_input(user_id)
+            self.phrase_input.put(user_id, True)
+            await message.reply_text(
+                "Пришлите свои фразы — каждую с новой строки. Всего можно сохранить до 10, каждая до 80 символов.",
+                reply_markup=back_keyboard("phrases", "Отменить ввод"),
+            )
+        else:
+            self.phrases.delete(user_id, int(query.data.split(":")[2]))
+            await self.phrase_menu(update, context)
 
     async def text(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         user_id = update.effective_user.id
         message = update.effective_message
+        if self.phrase_input.get(user_id):
+            try:
+                added = self.phrases.add(user_id, message.text.splitlines())
+            except ValueError as error:
+                await message.reply_text(str(error), reply_markup=back_keyboard("phrases", "Отменить ввод"))
+                return
+            self.phrase_input.discard(user_id)
+            await message.reply_text(f"Добавлено фраз: {added}.")
+            await self.phrase_menu(update, context)
+            return
         if self.proposals.targets.get(user_id) is not None:
             await message.reply_text("Пришлите фото с подписью к нему или выйдите командой /cancel.")
             return
@@ -261,6 +368,7 @@ class StickerBot:
         self.renaming.discard(user_id)
         self.naming.discard(user_id)
         self.proposals.cancel(user_id)
+        self.phrase_input.discard(user_id)
         await self.albums.start(update.effective_message, user_id)
 
     async def cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -270,6 +378,7 @@ class StickerBot:
         self.drafts.discard(user_id)
         self.naming.discard(user_id)
         self.proposals.cancel(user_id)
+        self.phrase_input.discard(user_id)
         await update.effective_message.reply_text("Редактирование закрыто. Можете прислать фото.", reply_markup=back_keyboard("home", "В главное меню"))
 
     async def remove_sticker(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -311,6 +420,17 @@ class StickerBot:
             await query.answer()
             return
         user_id = update.effective_user.id
+        if query.data in {"phrases", "video_help"}:
+            await query.answer()
+            if query.data == "phrases":
+                await self.phrase_menu(update, context)
+            else:
+                self.cancel_input(user_id)
+                await message.reply_text(
+                    "Отправьте короткое видео, GIF или кружок до 60 секунд и 20 МБ. Я предложу до четырёх разных кадров.",
+                    reply_markup=back_keyboard("resume", "Назад к редактированию"),
+                )
+            return
         if query.data in {"home", "resume", "inbox"}:
             await query.answer()
             if query.data == "home":
@@ -318,10 +438,12 @@ class StickerBot:
             elif query.data == "inbox":
                 await self.inbox(update, context)
             elif self.albums.sessions.get(user_id):
+                self.phrase_input.discard(user_id)
                 await self.albums.start(message, user_id)
             else:
                 draft = self.drafts.get(user_id)
                 if draft:
+                    self.phrase_input.discard(user_id)
                     self.naming.discard(user_id)
                     await self.show_preview(message, user_id, draft, remember=False)
                 else:
@@ -368,11 +490,24 @@ class StickerBot:
         await query.answer()
         self.renaming.discard(user_id)
         self.naming.discard(user_id)
+        self.phrase_input.discard(user_id)
 
         def option(label: str, value: str) -> Button:
             return Button(label, callback_data=f"d:{revision}:{value}")
 
-        if action == "colors":
+        if action.startswith("phrases:"):
+            draft.waiting_text = False
+            await show_variants(
+                message, draft, self.phrases, user_id, f"d:{revision}:", f"d:{revision}:back",
+                int(action.split(":")[1]),
+            )
+        elif action.startswith("phrase:"):
+            text = chosen_phrase(self.phrases, user_id, draft.phrase_scope, int(action.split(":")[1]))
+            if text is None:
+                await message.reply_text("Фраза удалена. Откройте «Мои фразы» ещё раз.")
+            else:
+                await self.show_preview(message, user_id, replace(draft, caption=text))
+        elif action == "colors":
             draft.waiting_text = False
             await message.reply_text(
                 "Выберите обводку. Последнюю правку можно отменить под стикером.",
@@ -456,6 +591,7 @@ async def report_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> No
 async def register_commands(app: Application) -> None:
     await app.bot.set_my_commands([
         BotCommand("start", "Главное меню"),
+        BotCommand("phrases", "Мои фразы"),
         BotCommand("settings", "Цвет обводки по умолчанию"),
         BotCommand("album", "Собрать набор из нескольких фото"),
         BotCommand("pack", "Мои наборы"),
@@ -465,13 +601,25 @@ async def register_commands(app: Application) -> None:
         BotCommand("cancel", "Закрыть черновик"),
     ])
 
+    await app.bot.set_my_commands([
+        BotCommand("meme", "Стикер из фото или видео ответом"),
+        BotCommand("phrase", "Сохранить общую фразу ответом"),
+        BotCommand("phrases", "Фразы беседы"),
+        BotCommand("group", "Включить бота в беседе"),
+        BotCommand("unphrase", "Удалить общую фразу по номеру"),
+    ], scope=BotCommandScopeAllGroupChats())
+
 
 def build_app(token: str, database: Path) -> Application:
     bot = StickerBot(Preferences(database))
-    app = Application.builder().token(token).concurrent_updates(False).post_init(register_commands).build()
+    app = (
+        Application.builder().token(token).concurrent_updates(False)
+        .connect_timeout(15).read_timeout(30).write_timeout(60).pool_timeout(15)
+        .post_init(register_commands).build()
+    )
     stores = (
         bot.drafts, bot.albums.sessions, bot.naming, bot.renaming,
-        bot.proposals.targets, bot.proposals.previews,
+        bot.proposals.targets, bot.proposals.previews, bot.phrase_input,
     )
     for store in stores:
         store.bot = app.bot
@@ -487,6 +635,19 @@ def build_app(token: str, database: Path) -> Application:
         return handle
 
     private = filters.ChatType.PRIVATE
+    groups = filters.ChatType.GROUPS
+
+    async def group_help(update, context):
+        await bot.groups.help(update.effective_message, context.bot.username)
+
+    app.add_handler(MessageHandler(groups & filters.StatusUpdate.NEW_CHAT_MEMBERS, bot.groups.joined))
+    app.add_handler(CommandHandler("start", group_help, filters=groups))
+    app.add_handler(CommandHandler("group", bot.groups.configure, filters=groups))
+    app.add_handler(CommandHandler("meme", bot.groups.meme, filters=groups))
+    app.add_handler(CommandHandler("phrase", bot.groups.add_phrase, filters=groups))
+    app.add_handler(CommandHandler("phrases", bot.groups.list_phrases, filters=groups))
+    app.add_handler(CommandHandler("unphrase", bot.groups.delete_phrase, filters=groups))
+    app.add_handler(CommandHandler("phrases", saved(bot.phrase_menu), filters=private))
     app.add_handler(CommandHandler("start", saved(bot.start), filters=private))
     app.add_handler(CommandHandler("settings", saved(bot.settings), filters=private))
     app.add_handler(CommandHandler("pack", saved(bot.my_pack), filters=private))
@@ -496,19 +657,25 @@ def build_app(token: str, database: Path) -> Application:
     app.add_handler(CommandHandler("cancel", saved(bot.cancel), filters=private))
     app.add_handler(CommandHandler("back", saved(bot.back), filters=private))
     app.add_handler(MessageHandler(private & filters.PHOTO, saved(bot.photo)))
+    app.add_handler(MessageHandler(
+        private & (filters.VIDEO | filters.VIDEO_NOTE | filters.ANIMATION | filters.Document.VIDEO),
+        saved(bot.video),
+    ))
     app.add_handler(MessageHandler(private & filters.TEXT & ~filters.COMMAND, saved(bot.text)))
     app.add_handler(CallbackQueryHandler(
         saved(bot.callback),
-        pattern=r"^(?:home|resume|inbox|album|pack|rename|remove_help|settings|default:(?:none|white|pink|yellow|blue)|d:[0-9a-f]{12}:(?:back|undo|redo|layout|position:(?:top|bottom)|gap:(?:8|24)|colors|captions|custom|clear|save|new|put:[0-9]+|color:(?:none|white|pink|yellow|blue)|template:[0-2]))$",
+        pattern=r"^(?:phrases|video_help|home|resume|inbox|album|pack|rename|remove_help|settings|default:(?:none|white|pink|yellow|blue)|d:[0-9a-f]{12}:(?:phrases:[0-6]|phrase:[0-9]+|back|undo|redo|layout|position:(?:top|bottom)|gap:(?:8|24)|colors|captions|custom|clear|save|new|put:[0-9]+|color:(?:none|white|pink|yellow|blue)|template:[0-2]))$",
     ))
     app.add_handler(CallbackQueryHandler(
         saved(bot.albums.callback),
-        pattern=r"^a:[0-9a-f]{10}:(?:review|edit:[0-7]|overview|back|undo|redo|restore|colors|color:(?:none|white|pink|yellow|blue)|layout|position:(?:top|bottom)|gap:(?:8|24)|caption|clear|drop|closer|cutout|frame|save|new|put:[0-9]+|retry|cancel|resume|close)$",
+        pattern=r"^a:[0-9a-f]{10}:(?:phrases:[0-6]|phrase:[0-9]+|use|review|edit:[0-7]|overview|back|undo|redo|restore|colors|color:(?:none|white|pink|yellow|blue)|layout|position:(?:top|bottom)|gap:(?:8|24)|caption|clear|drop|closer|cutout|frame|save|new|put:[0-9]+|retry|cancel|resume|close)$",
     ))
     app.add_handler(CallbackQueryHandler(saved(bot.manage_pack), pattern=r"^p:(?:open|rename|invite):[0-9]+$"))
     app.add_handler(CallbackQueryHandler(
         saved(bot.proposals.callback),
         pattern=r"^g:(?:(?:send|cancel|back):[0-9a-f]{10}|(?:approve|reject):[0-9]+)$",
     ))
+    app.add_handler(CallbackQueryHandler(saved(bot.phrase_callback), pattern=r"^f:(?:add|delete:[0-9]+)$"))
+    app.add_handler(CallbackQueryHandler(bot.groups.callback, pattern=r"^c:[A-Za-z0-9_-]{16}:[0-9]+$"))
     app.add_error_handler(report_error)
     return app

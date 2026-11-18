@@ -10,6 +10,7 @@ from telegram.error import BadRequest, TelegramError
 from .images import CAPTION_LIMIT, COLORS, ImageError, caption_font, cutout_photo, open_photo, photo_in_frame, render
 from .library import Library
 from .persistence import SavedDrafts
+from .phrases import Phrases, chosen_phrase, show_variants
 from .packs import MAX_TITLE, new_pack_name, owned_packs, pack_url, save_many
 from .photos import MAX_PHOTO_BYTES, photo_bytes
 from .state import Draft, Preferences, record_edit, restore_edit
@@ -23,6 +24,7 @@ MIN_PHOTOS = 3
 class Frame:
     photo: Image.Image
     draft: Draft
+    seconds: float | None = None
 
 
 @dataclass
@@ -31,6 +33,7 @@ class Album:
     photos: list[PhotoSize] = field(default_factory=list)
     frames: list[Frame] = field(default_factory=list)
     collecting: bool = True
+    from_video: bool = False
     waiting: str | None = None
     index: int = 0
     active_frame: int | None = None
@@ -71,7 +74,7 @@ def contact_sheet(frames: list[Frame]) -> bytes:
         with Image.open(BytesIO(frame.draft.preview)) as sticker:
             thumb = sticker.resize((176, 176), Image.Resampling.LANCZOS)
             sheet.paste(thumb, (x + 16, y + 27), thumb)
-        draw.text((x + 13, y + 7), str(index + 1), font=caption_font(20), fill="white")
+        draw.text((x + 13, y + 7), str(index + 1) + (f" · {frame.seconds:.1f}s" if frame.seconds is not None else ""), font=caption_font(20), fill="white")
     output = BytesIO()
     sheet.save(output, "JPEG", quality=91)
     return output.getvalue()
@@ -82,6 +85,8 @@ class Albums:
         self.preferences = preferences
         self.show_pack = show_pack
         self.library = library
+        self.phrases = Phrases(preferences.path)
+        self.show_single = None
         self.sessions = SavedDrafts(preferences.path, "albums", capacity=8)
 
     async def start(self, message, user_id: int) -> Album:
@@ -189,7 +194,7 @@ class Albums:
         preview = await asyncio.to_thread(contact_sheet, album.frames)
         await message.reply_photo(
             InputFile(preview, filename="album.jpg"),
-            caption=f"Будущий набор · {len(album.frames)} шт. Нажмите номер, чтобы изменить стикер.",
+            caption=(f"Моменты из видео · {len(album.frames)} шт. Выберите кадр по номеру." if album.from_video else f"Будущий набор · {len(album.frames)} шт. Нажмите номер, чтобы изменить стикер."),
             reply_markup=InlineKeyboardMarkup(keys),
         )
 
@@ -209,6 +214,9 @@ class Albums:
             [button("Перекадрировать", "closer"), button("Фото в рамке", "frame")],
             [button("Автовырезание", "cutout"), button("Убрать из альбома", "drop")],
         ]
+        keys.insert(1, [button("Мои фразы", "phrases:0")])
+        if album.from_video:
+            keys.insert(0, [button("Выбрать этот кадр", "use")])
         history = history_buttons(f"a:{album.revision}:", draft)
         if history:
             keys.append(history)
@@ -322,6 +330,24 @@ class Albums:
             index = int(action.split(":")[1])
             if index < len(album.frames):
                 await self.edit(message, album, index)
+        elif action == "use" and album.from_video and self.show_single is not None:
+            draft = album.frames[album.index].draft
+            await self.show_single(message, user_id, draft, remember=False)
+            self.sessions.discard(user_id)
+            await show_variants(message, draft, self.phrases, user_id, f"d:{draft.revision}:", f"d:{draft.revision}:back")
+        elif action.startswith("phrases:"):
+            album.waiting = None
+            await show_variants(
+                message, album.frames[album.index].draft, self.phrases, user_id,
+                f"a:{album.revision}:", f"a:{album.revision}:back", int(action.split(":")[1]),
+            )
+        elif action.startswith("phrase:"):
+            draft = album.frames[album.index].draft
+            text = chosen_phrase(self.phrases, user_id, draft.phrase_scope, int(action.split(":")[1]))
+            if text is None:
+                await message.reply_text("Фраза уже удалена. Откройте «Мои фразы» ещё раз.")
+            else:
+                await self.render_edit(message, album, replace(draft, caption=text))
         elif action == "back":
             await self.edit(message, album, album.index)
         elif action in {"undo", "redo"}:

@@ -1,7 +1,7 @@
 FROM python:3.12-slim
 ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
 WORKDIR /app
-RUN apt-get update && apt-get install -y --no-install-recommends fonts-dejavu-core libgomp1 \
+RUN apt-get update && apt-get install -y --no-install-recommends fonts-dejavu-core libgomp1 ffmpeg \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --uid 10001 --create-home sticker \
     && mkdir /app/data && chown sticker:sticker /app/data

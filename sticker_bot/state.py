@@ -42,6 +42,7 @@ class Draft:
     uploaded_id: str | None = None
     caption_position: str = "bottom"
     caption_gap: int = 8
+    phrase_scope: int | None = None
     undo: tuple["Draft", ...] = field(default=(), repr=False)
     redo: tuple["Draft", ...] = field(default=(), repr=False)
 
