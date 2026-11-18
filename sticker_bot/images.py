@@ -18,6 +18,7 @@ ALPHA_CLEANUP = [
     for value in range(256)
 ]
 COLORS = {
+    "none": ("Без обводки", None),
     "white": ("Белая", "#ffffff"),
     "pink": ("Розовая", "#ff5ea8"),
     "yellow": ("Жёлтая", "#ffd84d"),
@@ -141,10 +142,13 @@ def caption_layer(caption: str) -> Image.Image:
     raise ImageError("Не удалось разместить подпись. Попробуйте сократить текст.")
 
 
-def render(subject: Image.Image, color: str, caption: str = "") -> bytes:
+def render(
+    subject: Image.Image, color: str, caption: str = "",
+    caption_position: str = "bottom", caption_gap: int = CAPTION_GAP,
+) -> bytes:
     caption = " ".join(caption.split())
     label = caption_layer(caption) if caption else None
-    label_height = label.height + CAPTION_GAP if label else 0
+    label_height = label.height + caption_gap if label else 0
     available = SIZE - 2 * PADDING
     fitted = ImageOps.contain(
         subject, (available - 2 * OUTLINE_PADDING, available - 2 * OUTLINE_PADDING - label_height),
@@ -155,12 +159,13 @@ def render(subject: Image.Image, color: str, caption: str = "") -> bytes:
     )
     outlined.paste(fitted, (OUTLINE_PADDING, OUTLINE_PADDING))
 
-    # Dilate a solid silhouette so faint pixels cannot turn into a wide outline.
-    alpha = outlined.getchannel("A").point(lambda value: 255 if value >= 128 else 0)
-    outline = Image.new("RGBA", outlined.size, COLORS[color][1])
-    expanded = alpha.filter(ImageFilter.MaxFilter(2 * OUTLINE_RADIUS + 1))
-    outline.putalpha(expanded.filter(ImageFilter.GaussianBlur(0.55)))
-    outlined = Image.alpha_composite(outline, outlined)
+    if color != "none":
+        # Dilate a solid silhouette so faint pixels cannot turn into a wide outline.
+        alpha = outlined.getchannel("A").point(lambda value: 255 if value >= 128 else 0)
+        outline = Image.new("RGBA", outlined.size, COLORS[color][1])
+        expanded = alpha.filter(ImageFilter.MaxFilter(2 * OUTLINE_RADIUS + 1))
+        outline.putalpha(expanded.filter(ImageFilter.GaussianBlur(0.55)))
+        outlined = Image.alpha_composite(outline, outlined)
     box = outlined.getbbox()
     if box is None:
         raise ImageError("Не удалось выделить объект. Попробуйте другое фото.")
@@ -168,9 +173,11 @@ def render(subject: Image.Image, color: str, caption: str = "") -> bytes:
 
     canvas = Image.new("RGBA", (SIZE, SIZE))
     top = (SIZE - outlined.height - label_height) // 2
-    canvas.paste(outlined, ((SIZE - outlined.width) // 2, top))
+    subject_top = top + label_height if label and caption_position == "top" else top
+    canvas.paste(outlined, ((SIZE - outlined.width) // 2, subject_top))
     if label:
-        canvas.paste(label, ((SIZE - label.width) // 2, top + outlined.height + CAPTION_GAP))
+        label_top = top if caption_position == "top" else top + outlined.height + caption_gap
+        canvas.paste(label, ((SIZE - label.width) // 2, label_top))
 
     for quality in (90, 75, 55, 35):
         output = BytesIO()

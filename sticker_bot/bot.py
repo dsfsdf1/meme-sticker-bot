@@ -15,7 +15,8 @@ from .library import Library
 from .packs import DEFAULT_TITLE, MAX_TITLE, find_pack, new_pack_name, owned_packs, pack_name, pack_url, save_many, share_url
 from .proposals import Proposals
 from .photos import photo_bytes
-from .state import Draft, Drafts, Preferences
+from .state import Draft, Drafts, Preferences, record_edit, restore_edit
+from .navigation import back_keyboard, color_keyboard, history_buttons, home_button, position_keyboard
 
 LOG = logging.getLogger(__name__)
 TEMPLATES = ("Я всё понял", "Это база", "Когда уже пятница?")
@@ -31,43 +32,105 @@ class StickerBot:
         self.renaming: Drafts[int] = Drafts()
         self.naming: Drafts[tuple[str, str]] = Drafts()
 
+    def cancel_input(self, user_id: int) -> None:
+        self.renaming.discard(user_id)
+        self.naming.discard(user_id)
+        draft = self.drafts.get(user_id)
+        if draft:
+            draft.waiting_text = False
+        album = self.albums.sessions.get(user_id)
+        if album:
+            album.waiting = None
+
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         user_id = update.effective_user.id
         args = getattr(context, "args", None)
         if args and args[0].startswith("invite_"):
             await self.proposals.start(update.effective_message, user_id, args[0][7:])
             return
+        await self.home(update, context)
+
+    async def home(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        user_id = update.effective_user.id
+        self.cancel_input(user_id)
         self.proposals.cancel(user_id)
+        draft = self.drafts.get(user_id)
+        album = self.albums.sessions.get(user_id)
+        keys = [
+            [Button("Собрать стикерпак", callback_data="album")],
+            [Button("Мои наборы", callback_data="pack"), Button("Настройки", callback_data="settings")],
+            [Button("Предложения друзей", callback_data="inbox")],
+        ]
+        if album:
+            keys.insert(0, [Button("Вернуться к альбому", callback_data="album")])
+        elif draft:
+            keys.insert(0, [Button("Вернуться к стикеру", callback_data="resume")])
         await update.effective_message.reply_text(
             "Пришлите фото. Я удалю фон и пришлю стикер с обводкой. "
             "Чтобы собрать несколько стикеров сразу, пришлите альбом или нажмите «Собрать стикерпак».",
-            reply_markup=InlineKeyboardMarkup([
-                [Button("Собрать стикерпак", callback_data="album")],
-                [Button("Мои наборы", callback_data="pack"), Button("Настройки", callback_data="settings")],
-            ]),
+            reply_markup=InlineKeyboardMarkup(keys),
         )
 
+    async def back(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        user_id = update.effective_user.id
+        message = update.effective_message
+        if self.proposals.targets.get(user_id) is not None:
+            await self.home(update, context)
+            return
+        rename_id = self.renaming.get(user_id)
+        self.renaming.discard(user_id)
+        self.naming.discard(user_id)
+        album = self.albums.sessions.get(user_id)
+        if album:
+            if album.collecting:
+                await self.albums.collection_prompt(message, album)
+            elif album.title is not None:
+                await self.albums.retry_prompt(message, album)
+            elif album.waiting == "caption":
+                await self.albums.edit(message, album, album.index)
+            else:
+                await self.albums.overview(message, album)
+        elif rename_id:
+            pack = self.library.pack(rename_id)
+            await self.show_pack(message, pack_url(pack["name"]), context.bot.username, pack["title"])
+        elif self.drafts.get(user_id):
+            await self.show_preview(message, user_id, self.drafts.get(user_id), remember=False)
+        else:
+            await self.home(update, context)
+
     async def settings(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        self.cancel_input(update.effective_user.id)
         selected = self.preferences.color(update.effective_user.id)
         keys = [
             Button(("✓ " if color == selected else "") + label, callback_data=f"default:{color}")
             for color, (label, _) in COLORS.items()
         ]
         await update.effective_message.reply_text(
-            "Обводка для новых фото", reply_markup=InlineKeyboardMarkup([keys[:2], keys[2:]])
+            "Обводка для новых фото", reply_markup=InlineKeyboardMarkup([keys[:1], keys[1:3], keys[3:], [home_button()]])
         )
 
-    async def show_preview(self, message, user_id: int, draft: Draft) -> None:
-        preview = await asyncio.to_thread(render, draft.subject, draft.color, draft.caption)
+    async def show_preview(self, message, user_id: int, draft: Draft, remember: bool = True) -> None:
+        current = self.drafts.get(user_id)
+        if remember and current:
+            draft = record_edit(current, draft)
+        preview = await asyncio.to_thread(
+            render, draft.subject, draft.color, draft.caption, draft.caption_position, draft.caption_gap,
+        )
         draft = replace(draft, preview=preview, revision=token_hex(6), uploaded_id=None, waiting_text=False)
 
         def button(label: str, action: str) -> Button:
             return Button(label, callback_data=f"d:{draft.revision}:{action}")
 
-        keyboard = InlineKeyboardMarkup([
+        keys = [
             [button("Обводка", "colors"), button("Подпись", "captions")],
+            [button("Расположение текста", "layout")],
             [button("Выбрать набор", "save")],
-        ])
+        ]
+        history = history_buttons(f"d:{draft.revision}:", draft)
+        if history:
+            keys.append(history)
+        keys.append([home_button()])
+        keyboard = InlineKeyboardMarkup(keys)
         await message.reply_sticker(InputFile(preview, filename="sticker.webp"), reply_markup=keyboard)
         self.drafts.put(user_id, draft)
 
@@ -85,7 +148,7 @@ class StickerBot:
         try:
             data = await photo_bytes(message.photo[-1])
             subject = await asyncio.to_thread(cutout, data)
-            await self.show_preview(message, user_id, Draft(subject, self.preferences.color(user_id)))
+            await self.show_preview(message, user_id, Draft(subject, self.preferences.color(user_id)), remember=False)
         except ImageError as error:
             await status.edit_text(str(error))
         except (UnidentifiedImageError, Image.DecompressionBombError):
@@ -145,15 +208,17 @@ class StickerBot:
                 [Button("Пригласить друзей", callback_data=f"p:invite:{pack_id}")],
             ])
         keys.extend([
+            [home_button()],
             [Button("Мои наборы", callback_data="pack"), Button("Как удалить стикер", callback_data="remove_help")],
             [Button("Поделиться ботом", url=share_url(f"https://t.me/{bot_username}", "Сделай стикер из фото"))],
         ])
         await message.reply_text(f"Ваш набор «{title}»", reply_markup=InlineKeyboardMarkup(keys))
 
     async def my_pack(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        self.cancel_input(update.effective_user.id)
         packs = await owned_packs(context.bot, update.effective_user.id, self.library)
         choices = [[Button(pack["title"], callback_data=f"p:open:{pack['id']}")] for pack in packs]
-        choices.append([Button("Собрать стикерпак", callback_data="album")])
+        choices.append([Button("Собрать стикерпак", callback_data="album"), home_button()])
         await update.effective_message.reply_text(
             "Мои наборы" if packs else "Пришлите фото, чтобы создать первый набор.",
             reply_markup=InlineKeyboardMarkup(choices),
@@ -171,22 +236,24 @@ class StickerBot:
         await query.answer()
         name, title = pack["name"], pack["title"]
         if action == "open":
+            self.cancel_input(user_id)
             await self.show_pack(message, pack_url(name), context.bot.username, title)
         elif action == "invite":
             token = self.library.invite(pack["id"], user_id)
             link = f"https://t.me/{context.bot.username}?start=invite_{token}"
             await message.reply_text(
                 f"По этой ссылке друзья смогут предложить стикер в «{title}». Вы решаете, что попадёт в набор.\n{link}",
-                reply_markup=InlineKeyboardMarkup([[Button("Отправить приглашение", url=share_url(link, f"Предложи стикер в «{title}»"))]]),
+                reply_markup=InlineKeyboardMarkup([[Button("Отправить приглашение", url=share_url(link, f"Предложи стикер в «{title}»"))], [Button("Назад к набору", callback_data=f"p:open:{selected}"), home_button()]]),
             )
         elif self.albums.sessions.get(user_id):
             await message.reply_text("Сначала завершите или закройте альбом командой /cancel.")
         else:
             self.naming.discard(user_id)
             self.renaming.put(user_id, pack["id"])
-            await message.reply_text("Введите новое название набора, до 64 символов. /cancel — отменить.")
+            await message.reply_text("Введите новое название набора, до 64 символов.", reply_markup=back_keyboard(f"p:open:{selected}", "Отменить ввод"))
 
     async def inbox(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        self.cancel_input(update.effective_user.id)
         await self.proposals.inbox(update.effective_message, update.effective_user.id, context.bot)
 
     async def album(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -203,14 +270,17 @@ class StickerBot:
         self.drafts.discard(user_id)
         self.naming.discard(user_id)
         self.proposals.cancel(user_id)
-        await update.effective_message.reply_text("Редактирование закрыто. Можете прислать фото.")
+        await update.effective_message.reply_text("Редактирование закрыто. Можете прислать фото.", reply_markup=back_keyboard("home", "В главное меню"))
 
     async def remove_sticker(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         message = update.effective_message
         replied = message.reply_to_message
         chosen = replied.sticker if replied else None
         if chosen is None:
-            await message.reply_text("Отправьте стикер из своего набора в этот чат и ответьте на него командой /remove.")
+            await message.reply_text(
+                    "Отправьте стикер из своего набора в этот чат и ответьте на него командой /remove.",
+                    reply_markup=back_keyboard("pack", "Назад к наборам"),
+                )
             return
         user_id = update.effective_user.id
         name = chosen.set_name
@@ -241,6 +311,22 @@ class StickerBot:
             await query.answer()
             return
         user_id = update.effective_user.id
+        if query.data in {"home", "resume", "inbox"}:
+            await query.answer()
+            if query.data == "home":
+                await self.home(update, context)
+            elif query.data == "inbox":
+                await self.inbox(update, context)
+            elif self.albums.sessions.get(user_id):
+                await self.albums.start(message, user_id)
+            else:
+                draft = self.drafts.get(user_id)
+                if draft:
+                    self.naming.discard(user_id)
+                    await self.show_preview(message, user_id, draft, remember=False)
+                else:
+                    await self.home(update, context)
+            return
         if query.data in {"album", "pack", "rename", "remove_help"}:
             await query.answer()
             if query.data == "album":
@@ -248,19 +334,25 @@ class StickerBot:
             elif query.data == "pack":
                 await self.my_pack(update, context)
             elif query.data == "remove_help":
-                await message.reply_text("Отправьте стикер из своего набора в этот чат и ответьте на него командой /remove.")
+                await message.reply_text(
+                    "Отправьте стикер из своего набора в этот чат и ответьте на него командой /remove.",
+                    reply_markup=back_keyboard("pack", "Назад к наборам"),
+                )
             else:
                 await self.my_pack(update, context)
             return
         if query.data == "settings":
             await query.answer()
+            self.renaming.discard(user_id)
+            self.naming.discard(user_id)
             await self.settings(update, context)
             return
         if query.data.startswith("default:"):
             color = query.data.split(":")[1]
             if color in COLORS:
                 self.preferences.set_color(user_id, color)
-                await query.answer(f"Цвет для новых фото: {COLORS[color][0].lower()}")
+                await query.answer("Настройка сохранена")
+                await self.settings(update, context)
             else:
                 await query.answer()
             return
@@ -281,23 +373,44 @@ class StickerBot:
             return Button(label, callback_data=f"d:{revision}:{value}")
 
         if action == "colors":
-            keys = [option(label, f"color:{key}") for key, (label, _) in COLORS.items()]
-            await message.reply_text("Цвет обводки", reply_markup=InlineKeyboardMarkup([keys[:2], keys[2:]]))
+            draft.waiting_text = False
+            await message.reply_text(
+                "Выберите обводку. Последнюю правку можно отменить под стикером.",
+                reply_markup=color_keyboard(f"d:{revision}:", draft.color, f"d:{revision}:back"),
+            )
         elif action == "captions":
+            draft.waiting_text = False
             keys = [[option(label, f"template:{index}")] for index, label in enumerate(TEMPLATES)]
             keys.append([option("Своя подпись", "custom"), option("Без подписи", "clear")])
+            keys.append([option("Расположение текста", "layout")])
+            keys.append([option("Назад к стикеру", "back"), home_button()])
             await message.reply_text("Подпись на стикере", reply_markup=InlineKeyboardMarkup(keys))
         elif action == "custom":
-            await message.reply_text(f"Отправьте подпись одним сообщением, до {CAPTION_LIMIT} символов.")
+            await message.reply_text(f"Отправьте подпись одним сообщением, до {CAPTION_LIMIT} символов.", reply_markup=back_keyboard(f"d:{revision}:captions", "Отменить ввод"))
             draft.waiting_text = True
+        elif action in {"undo", "redo", "back"}:
+            restored = restore_edit(draft, action)
+            await self.show_preview(message, user_id, restored, remember=False)
+        elif action == "layout":
+            draft.waiting_text = False
+            await message.reply_text(
+                "Где разместить подпись?",
+                reply_markup=position_keyboard(f"d:{revision}:", draft, f"d:{revision}:back"),
+            )
+        elif action.startswith("position:"):
+            await self.show_preview(message, user_id, replace(draft, caption_position=action.split(":")[1]))
+        elif action.startswith("gap:"):
+            await self.show_preview(message, user_id, replace(draft, caption_gap=int(action.split(":")[1])))
         elif action == "save":
+            draft.waiting_text = False
             packs = await owned_packs(context.bot, user_id, self.library)
             keys = [[option("Создать новый", "new")]]
             keys.extend([option(pack["title"], f"put:{pack['id']}")] for pack in packs)
+            keys.append([option("Назад к стикеру", "back"), home_button()])
             await message.reply_text("Куда сохранить стикер?", reply_markup=InlineKeyboardMarkup(keys))
         elif action == "new":
             self.naming.put(user_id, (revision, new_pack_name(user_id, context.bot.username)))
-            await message.reply_text("Напишите название нового набора. /cancel — отменить.")
+            await message.reply_text("Напишите название нового набора.", reply_markup=back_keyboard(f"d:{revision}:save", "Отменить ввод"))
         elif action.startswith("put:"):
             pack = self.library.pack(int(action.split(":")[1]))
             if pack is None or pack["owner"] != user_id:
@@ -338,12 +451,13 @@ async def report_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def register_commands(app: Application) -> None:
     await app.bot.set_my_commands([
-        BotCommand("start", "Создать стикер"),
+        BotCommand("start", "Главное меню"),
         BotCommand("settings", "Цвет обводки по умолчанию"),
         BotCommand("album", "Собрать набор из нескольких фото"),
         BotCommand("pack", "Мои наборы"),
         BotCommand("inbox", "Предложения от друзей"),
         BotCommand("remove", "Удалить стикер ответом на него"),
+        BotCommand("back", "Назад к редактированию"),
         BotCommand("cancel", "Закрыть черновик"),
     ])
 
@@ -359,20 +473,21 @@ def build_app(token: str, database: Path) -> Application:
     app.add_handler(CommandHandler("album", bot.album, filters=private))
     app.add_handler(CommandHandler("remove", bot.remove_sticker, filters=private))
     app.add_handler(CommandHandler("cancel", bot.cancel, filters=private))
+    app.add_handler(CommandHandler("back", bot.back, filters=private))
     app.add_handler(MessageHandler(private & filters.PHOTO, bot.photo))
     app.add_handler(MessageHandler(private & filters.TEXT & ~filters.COMMAND, bot.text))
     app.add_handler(CallbackQueryHandler(
         bot.callback,
-        pattern=r"^(?:album|pack|rename|remove_help|settings|default:(?:white|pink|yellow|blue)|d:[0-9a-f]{12}:(?:colors|captions|custom|clear|save|new|put:[0-9]+|color:(?:white|pink|yellow|blue)|template:[0-2]))$",
+        pattern=r"^(?:home|resume|inbox|album|pack|rename|remove_help|settings|default:(?:none|white|pink|yellow|blue)|d:[0-9a-f]{12}:(?:back|undo|redo|layout|position:(?:top|bottom)|gap:(?:8|24)|colors|captions|custom|clear|save|new|put:[0-9]+|color:(?:none|white|pink|yellow|blue)|template:[0-2]))$",
     ))
     app.add_handler(CallbackQueryHandler(
         bot.albums.callback,
-        pattern=r"^a:[0-9a-f]{10}:(?:review|edit:[0-7]|overview|caption|clear|drop|closer|cutout|frame|save|new|put:[0-9]+|retry|cancel)$",
+        pattern=r"^a:[0-9a-f]{10}:(?:review|edit:[0-7]|overview|back|undo|redo|restore|colors|color:(?:none|white|pink|yellow|blue)|layout|position:(?:top|bottom)|gap:(?:8|24)|caption|clear|drop|closer|cutout|frame|save|new|put:[0-9]+|retry|cancel|resume|close)$",
     ))
     app.add_handler(CallbackQueryHandler(bot.manage_pack, pattern=r"^p:(?:open|rename|invite):[0-9]+$"))
     app.add_handler(CallbackQueryHandler(
         bot.proposals.callback,
-        pattern=r"^g:(?:(?:send|cancel):[0-9a-f]{10}|(?:approve|reject):[0-9]+)$",
+        pattern=r"^g:(?:(?:send|cancel|back):[0-9a-f]{10}|(?:approve|reject):[0-9]+)$",
     ))
     app.add_error_handler(report_error)
     return app

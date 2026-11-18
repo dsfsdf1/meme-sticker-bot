@@ -1,6 +1,6 @@
 from collections import OrderedDict
 from contextlib import closing
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from secrets import token_hex
 from time import monotonic
@@ -40,6 +40,30 @@ class Draft:
     preview: bytes = b""
 
     uploaded_id: str | None = None
+    caption_position: str = "bottom"
+    caption_gap: int = 8
+    undo: tuple["Draft", ...] = field(default=(), repr=False)
+    redo: tuple["Draft", ...] = field(default=(), repr=False)
+
+
+def snapshot(draft: Draft) -> Draft:
+    return replace(draft, undo=(), redo=(), waiting_text=False, preview=b"", uploaded_id=None)
+
+
+def record_edit(current: Draft, edited: Draft) -> Draft:
+    if (current.subject is edited.subject and current.color == edited.color
+            and current.caption == edited.caption and current.caption_position == edited.caption_position
+            and current.caption_gap == edited.caption_gap):
+        return edited
+    return replace(edited, undo=(*current.undo[-9:], snapshot(current)), redo=())
+
+
+def restore_edit(draft: Draft, action: str) -> Draft:
+    if action == "undo" and draft.undo:
+        return replace(draft.undo[-1], undo=draft.undo[:-1], redo=(*draft.redo[-9:], snapshot(draft)))
+    if action == "redo" and draft.redo:
+        return replace(draft.redo[-1], redo=draft.redo[:-1], undo=(*draft.undo[-9:], snapshot(draft)))
+    return draft
 
 
 T = TypeVar("T")

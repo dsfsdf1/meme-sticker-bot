@@ -12,6 +12,7 @@ from .library import Library
 from .packs import pack_url
 from .photos import photo_bytes
 from .state import Drafts, Preferences
+from .navigation import back_keyboard, home_button
 
 
 @dataclass
@@ -41,7 +42,8 @@ class Proposals:
         self.targets.put(user_id, pack["id"])
         await message.reply_text(
             f"Предложите стикер в набор «{pack['title']}». Пришлите одно фото. "
-            "Текст можно добавить прямо в подпись к фотографии. /cancel — выйти."
+            "Текст можно добавить прямо в подпись к фотографии.",
+            reply_markup=back_keyboard("home", "Выйти из приглашения"),
         )
 
     async def photo(self, message, user_id: int) -> bool:
@@ -66,7 +68,8 @@ class Proposals:
             InputFile(frame.draft.preview, filename="sticker.webp"),
             reply_markup=InlineKeyboardMarkup([
                 [Button("Предложить владельцу", callback_data=f"g:send:{revision}")],
-                [Button("Отменить", callback_data=f"g:cancel:{revision}")],
+                [Button("Выбрать другое фото", callback_data=f"g:back:{revision}")],
+                [Button("Отменить предложение", callback_data=f"g:cancel:{revision}"), home_button()],
             ]),
         )
         self.previews.put(user_id, Suggestion(pack_id, preview.sticker.file_id, revision))
@@ -80,13 +83,13 @@ class Proposals:
             reply_markup=InlineKeyboardMarkup([[
                 Button("Добавить", callback_data=f"g:approve:{proposal['id']}"),
                 Button("Отклонить", callback_data=f"g:reject:{proposal['id']}"),
-            ]]),
+            ], [home_button()]]),
         )
 
     async def inbox(self, message, user_id: int, bot) -> None:
         rows = self.library.pending(user_id)
         if not rows:
-            await message.reply_text("Новых предложений пока нет.")
+            await message.reply_text("Новых предложений пока нет.", reply_markup=back_keyboard("home", "Главное меню"))
         for proposal in rows:
             await self.notify(bot, user_id, proposal)
 
@@ -98,15 +101,22 @@ class Proposals:
             return
         user_id = update.effective_user.id
         _, action, value = query.data.split(":")
-        if action in {"send", "cancel"}:
+        if action in {"send", "cancel", "back"}:
             preview = self.previews.get(user_id)
             if preview is None or preview.revision != value:
                 await query.answer("Предпросмотр устарел.", show_alert=True)
                 return
             await query.answer()
+            if action == "back":
+                self.previews.discard(user_id)
+                await message.reply_text(
+                    "Пришлите другое фото с подписью.",
+                    reply_markup=back_keyboard("home", "Выйти из приглашения"),
+                )
+                return
             if action == "cancel":
                 self.cancel(user_id)
-                await message.reply_text("Предложение отменено.")
+                await message.reply_text("Предложение отменено.", reply_markup=back_keyboard("home", "Главное меню"))
                 return
             pack = self.library.pack(preview.pack_id)
             if pack is None or not self.library.can_propose(preview.pack_id, user_id):
@@ -120,7 +130,7 @@ class Proposals:
             except TelegramError:
                 # The owner can still review a saved proposal from /inbox.
                 pass
-            await message.reply_text("Предложение отправлено владельцу набора.")
+            await message.reply_text("Предложение отправлено владельцу набора.", reply_markup=back_keyboard("home", "Главное меню"))
             return
 
         proposal = self.library.pending(user_id, int(value))
@@ -141,7 +151,7 @@ class Proposals:
                 return
         accepted = action == "approve"
         self.library.resolve(proposal["id"])
-        await message.reply_text("Стикер добавлен." if accepted else "Предложение отклонено.")
+        await message.reply_text("Стикер добавлен." if accepted else "Предложение отклонено.", reply_markup=back_keyboard("inbox", "К предложениям"))
         if proposal["sender"] != user_id:
             text = (
                 "Ваш стикер добавлен в набор. " + pack_url(proposal["name"])

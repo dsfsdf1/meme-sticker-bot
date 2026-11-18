@@ -7,11 +7,12 @@ from PIL import Image, ImageDraw, UnidentifiedImageError
 from telegram import InlineKeyboardButton as Button, InlineKeyboardMarkup, InputFile, PhotoSize
 from telegram.error import BadRequest, TelegramError
 
-from .images import CAPTION_LIMIT, ImageError, caption_font, cutout_photo, open_photo, photo_in_frame, render
+from .images import CAPTION_LIMIT, COLORS, ImageError, caption_font, cutout_photo, open_photo, photo_in_frame, render
 from .library import Library
 from .packs import MAX_TITLE, new_pack_name, owned_packs, pack_url, save_many
 from .photos import MAX_PHOTO_BYTES, photo_bytes
-from .state import Draft, Drafts, Preferences
+from .state import Draft, Drafts, Preferences, record_edit, restore_edit
+from .navigation import back_keyboard, color_keyboard, history_buttons, home_button, position_keyboard
 
 MAX_PHOTOS = 8
 MIN_PHOTOS = 3
@@ -33,6 +34,7 @@ class Album:
     index: int = 0
     title: str | None = None
     target: str | None = None
+    removed: list[tuple[int, Frame]] = field(default_factory=list)
     progress_task: asyncio.Task | None = field(default=None, repr=False)
     limit_warned: bool = False
 
@@ -108,7 +110,7 @@ class Albums:
             text,
             reply_markup=InlineKeyboardMarkup([
                 [self.button(album, "Посмотреть превью", "review")],
-                [self.button(album, "Отменить", "cancel")],
+                [self.button(album, "Закрыть альбом", "cancel"), home_button()],
             ]),
         )
 
@@ -175,7 +177,12 @@ class Albums:
         album.revision = token_hex(5)
         buttons = [self.button(album, str(index + 1), f"edit:{index}") for index in range(len(album.frames))]
         keys = [buttons[offset:offset + 4] for offset in range(0, len(buttons), 4)]
-        keys.extend([[self.button(album, "Сохранить стикеры", "save")], [self.button(album, "Отменить", "cancel")]])
+        if album.removed:
+            keys.append([self.button(album, "↶ Вернуть удалённый кадр", "restore")])
+        keys.extend([
+            [self.button(album, "Сохранить стикеры", "save")],
+            [self.button(album, "Закрыть альбом", "cancel"), home_button()],
+        ])
         preview = await asyncio.to_thread(contact_sheet, album.frames)
         await message.reply_photo(
             InputFile(preview, filename="album.jpg"),
@@ -190,18 +197,34 @@ class Albums:
         def button(text: str, action: str) -> Button:
             return self.button(album, text, action)
 
+        draft = album.frames[index].draft
+        keys = [
+            [button("Обводка", "colors"), button("Подпись", "caption")],
+            [button("Расположение текста", "layout"), button("Убрать подпись", "clear")],
+            [button("Перекадрировать", "closer"), button("Фото в рамке", "frame")],
+            [button("Автовырезание", "cutout"), button("Убрать из альбома", "drop")],
+        ]
+        history = history_buttons(f"a:{album.revision}:", draft)
+        if history:
+            keys.append(history)
+        pages = []
+        if index:
+            pages.append(button("← Предыдущий кадр", f"edit:{index - 1}"))
+        if index + 1 < len(album.frames):
+            pages.append(button("Следующий кадр →", f"edit:{index + 1}"))
+        if pages:
+            keys.append(pages)
+        keys.append([button("К обзору", "overview"), home_button()])
         await message.reply_sticker(
-            InputFile(album.frames[index].draft.preview, filename="sticker.webp"),
-            reply_markup=InlineKeyboardMarkup([
-                [button("Подпись", "caption"), button("Убрать подпись", "clear")],
-                [button("Перекадрировать", "closer"), button("Фото в рамке", "frame")],
-                [button("Автовырезание", "cutout"), button("Убрать из альбома", "drop")],
-                [button("К обзору", "overview")],
-            ]),
+            InputFile(draft.preview, filename="sticker.webp"), reply_markup=InlineKeyboardMarkup(keys),
         )
 
-    async def render_edit(self, message, album: Album, draft: Draft) -> None:
-        draft.preview = await asyncio.to_thread(render, draft.subject, draft.color, draft.caption)
+    async def render_edit(self, message, album: Album, draft: Draft, remember: bool = True) -> None:
+        if remember:
+            draft = record_edit(album.frames[album.index].draft, draft)
+        draft.preview = await asyncio.to_thread(
+            render, draft.subject, draft.color, draft.caption, draft.caption_position, draft.caption_gap,
+        )
         draft.uploaded_id = None
         album.frames[album.index].draft = draft
         await self.edit(message, album, album.index)
@@ -265,8 +288,25 @@ class Albums:
             return
         await query.answer()
         if action == "cancel":
+            await message.reply_text(
+                "Закрыть альбом и удалить этот черновик?",
+                reply_markup=InlineKeyboardMarkup([
+                    [self.button(album, "Продолжить редактирование", "resume")],
+                    [self.button(album, "Удалить черновик", "close")],
+                ]),
+            )
+        elif action == "resume":
+            if album.collecting:
+                await self.collection_prompt(message, album)
+            elif album.title is not None:
+                await self.retry_prompt(message, album)
+            else:
+                await self.overview(message, album)
+        elif action == "close":
+            if album.progress_task:
+                album.progress_task.cancel()
             self.sessions.discard(user_id)
-            await message.reply_text("Альбом закрыт. Чтобы начать заново, откройте /album.")
+            await message.reply_text("Альбом закрыт.", reply_markup=back_keyboard("home", "В главное меню"))
         elif action == "review" and album.collecting:
             await self.review(message, user_id, album)
         elif action == "retry" and album.title is not None:
@@ -277,19 +317,48 @@ class Albums:
             index = int(action.split(":")[1])
             if index < len(album.frames):
                 await self.edit(message, album, index)
+        elif action == "back":
+            await self.edit(message, album, album.index)
+        elif action in {"undo", "redo"}:
+            draft = restore_edit(album.frames[album.index].draft, action)
+            await self.render_edit(message, album, draft, remember=False)
+        elif action == "colors":
+            album.waiting = None
+            draft = album.frames[album.index].draft
+            await message.reply_text(
+                "Выберите обводку.",
+                reply_markup=color_keyboard(f"a:{album.revision}:", draft.color, f"a:{album.revision}:back"),
+            )
+        elif action.startswith("color:"):
+            await self.render_edit(message, album, replace(album.frames[album.index].draft, color=action.split(":")[1]))
+        elif action == "layout":
+            album.waiting = None
+            await message.reply_text(
+                "Где разместить подпись?",
+                reply_markup=position_keyboard(f"a:{album.revision}:", album.frames[album.index].draft, f"a:{album.revision}:back"),
+            )
+        elif action.startswith("position:"):
+            await self.render_edit(message, album, replace(album.frames[album.index].draft, caption_position=action.split(":")[1]))
+        elif action.startswith("gap:"):
+            await self.render_edit(message, album, replace(album.frames[album.index].draft, caption_gap=int(action.split(":")[1])))
+        elif action == "restore" and album.removed:
+            index, frame = album.removed.pop()
+            album.frames.insert(index, frame)
+            await self.overview(message, album)
         elif action == "overview":
             await self.overview(message, album)
         elif action == "save":
+            album.waiting = None
             packs = await owned_packs(context.bot, user_id, self.library)
             keys = [[self.button(album, "Создать новый", "new")]]
             keys.extend([self.button(album, row["title"], f"put:{row['id']}")] for row in packs)
-            keys.append([self.button(album, "К обзору", "overview")])
+            keys.append([self.button(album, "К обзору", "overview"), home_button()])
             await message.reply_text("Куда сохранить стикеры?", reply_markup=InlineKeyboardMarkup(keys))
         elif action == "new":
             album.target = new_pack_name(user_id, context.bot.username)
             album.waiting = "title"
             album.revision = token_hex(5)
-            await message.reply_text("Напишите название нового набора. /album — вернуться к обзору.")
+            await message.reply_text("Напишите название нового набора.", reply_markup=back_keyboard(f"a:{album.revision}:save", "Отменить ввод"))
         elif action.startswith("put:"):
             pack = self.library.pack(int(action.split(":")[1]))
             if pack is None or pack["owner"] != user_id:
@@ -299,20 +368,20 @@ class Albums:
             await self.save(message, user_id, context.bot, album, pack["title"])
         elif action == "caption":
             album.waiting = "caption"
-            await message.reply_text(f"Введите подпись, до {CAPTION_LIMIT} символов.")
+            await message.reply_text(f"Введите подпись, до {CAPTION_LIMIT} символов.", reply_markup=back_keyboard(f"a:{album.revision}:back", "Отменить ввод"))
         elif action == "clear":
             await self.render_edit(message, album, replace(album.frames[album.index].draft, caption=""))
         elif action == "drop":
             if len(album.frames) == 1:
                 await message.reply_text("В альбоме остался один стикер. Его можно сохранить или отменить альбом.")
             else:
-                del album.frames[album.index]
+                album.removed.append((album.index, album.frames.pop(album.index)))
                 await self.overview(message, album)
         elif action in {"closer", "frame", "cutout"}:
             frame = album.frames[album.index]
             try:
                 subject = await asyncio.to_thread(frame_subject, frame.photo, action)
             except ImageError:
-                await message.reply_text("На этом кадре объект не выделился. Попробуйте «Фото в рамке».")
+                await message.reply_text("На этом кадре объект не выделился. Попробуйте «Фото в рамке».", reply_markup=back_keyboard(f"a:{album.revision}:back", "К редактору"))
                 return
             await self.render_edit(message, album, replace(frame.draft, subject=subject))
