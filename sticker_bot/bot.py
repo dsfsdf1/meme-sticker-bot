@@ -14,7 +14,8 @@ from .library import Library
 from .packs import DEFAULT_TITLE, MAX_TITLE, find_pack, new_pack_name, owned_packs, pack_name, pack_url, save_many, share_url
 from .proposals import Proposals
 from .photos import photo_bytes
-from .state import Draft, Drafts, Preferences, record_edit, restore_edit
+from .persistence import SavedDrafts
+from .state import Draft, Preferences, record_edit, restore_edit
 from .navigation import back_keyboard, color_keyboard, history_buttons, home_button, position_keyboard, refresh_options
 
 LOG = logging.getLogger(__name__)
@@ -24,12 +25,12 @@ TEMPLATES = ("Я всё понял", "Это база", "Когда уже пя�
 class StickerBot:
     def __init__(self, preferences: Preferences):
         self.preferences = preferences
-        self.drafts: Drafts[Draft] = Drafts()
+        self.drafts = SavedDrafts(preferences.path, "single")
         self.library = Library(preferences.path)
         self.albums = Albums(preferences, self.library, self.show_pack)
         self.proposals = Proposals(self.library, preferences)
-        self.renaming: Drafts[int] = Drafts()
-        self.naming: Drafts[tuple[str, str]] = Drafts()
+        self.renaming = SavedDrafts(preferences.path, "renaming")
+        self.naming = SavedDrafts(preferences.path, "naming")
 
     def cancel_input(self, user_id: int) -> None:
         self.renaming.discard(user_id)
@@ -468,28 +469,45 @@ async def register_commands(app: Application) -> None:
 def build_app(token: str, database: Path) -> Application:
     bot = StickerBot(Preferences(database))
     app = Application.builder().token(token).concurrent_updates(False).post_init(register_commands).build()
+    stores = (
+        bot.drafts, bot.albums.sessions, bot.naming, bot.renaming,
+        bot.proposals.targets, bot.proposals.previews,
+    )
+    for store in stores:
+        store.bot = app.bot
+
+    def saved(callback):
+        async def handle(update, context):
+            try:
+                return await callback(update, context)
+            finally:
+                if update.effective_user:
+                    for store in stores:
+                        store.save_cached(update.effective_user.id)
+        return handle
+
     private = filters.ChatType.PRIVATE
-    app.add_handler(CommandHandler("start", bot.start, filters=private))
-    app.add_handler(CommandHandler("settings", bot.settings, filters=private))
-    app.add_handler(CommandHandler("pack", bot.my_pack, filters=private))
-    app.add_handler(CommandHandler("inbox", bot.inbox, filters=private))
-    app.add_handler(CommandHandler("album", bot.album, filters=private))
-    app.add_handler(CommandHandler("remove", bot.remove_sticker, filters=private))
-    app.add_handler(CommandHandler("cancel", bot.cancel, filters=private))
-    app.add_handler(CommandHandler("back", bot.back, filters=private))
-    app.add_handler(MessageHandler(private & filters.PHOTO, bot.photo))
-    app.add_handler(MessageHandler(private & filters.TEXT & ~filters.COMMAND, bot.text))
+    app.add_handler(CommandHandler("start", saved(bot.start), filters=private))
+    app.add_handler(CommandHandler("settings", saved(bot.settings), filters=private))
+    app.add_handler(CommandHandler("pack", saved(bot.my_pack), filters=private))
+    app.add_handler(CommandHandler("inbox", saved(bot.inbox), filters=private))
+    app.add_handler(CommandHandler("album", saved(bot.album), filters=private))
+    app.add_handler(CommandHandler("remove", saved(bot.remove_sticker), filters=private))
+    app.add_handler(CommandHandler("cancel", saved(bot.cancel), filters=private))
+    app.add_handler(CommandHandler("back", saved(bot.back), filters=private))
+    app.add_handler(MessageHandler(private & filters.PHOTO, saved(bot.photo)))
+    app.add_handler(MessageHandler(private & filters.TEXT & ~filters.COMMAND, saved(bot.text)))
     app.add_handler(CallbackQueryHandler(
-        bot.callback,
+        saved(bot.callback),
         pattern=r"^(?:home|resume|inbox|album|pack|rename|remove_help|settings|default:(?:none|white|pink|yellow|blue)|d:[0-9a-f]{12}:(?:back|undo|redo|layout|position:(?:top|bottom)|gap:(?:8|24)|colors|captions|custom|clear|save|new|put:[0-9]+|color:(?:none|white|pink|yellow|blue)|template:[0-2]))$",
     ))
     app.add_handler(CallbackQueryHandler(
-        bot.albums.callback,
+        saved(bot.albums.callback),
         pattern=r"^a:[0-9a-f]{10}:(?:review|edit:[0-7]|overview|back|undo|redo|restore|colors|color:(?:none|white|pink|yellow|blue)|layout|position:(?:top|bottom)|gap:(?:8|24)|caption|clear|drop|closer|cutout|frame|save|new|put:[0-9]+|retry|cancel|resume|close)$",
     ))
-    app.add_handler(CallbackQueryHandler(bot.manage_pack, pattern=r"^p:(?:open|rename|invite):[0-9]+$"))
+    app.add_handler(CallbackQueryHandler(saved(bot.manage_pack), pattern=r"^p:(?:open|rename|invite):[0-9]+$"))
     app.add_handler(CallbackQueryHandler(
-        bot.proposals.callback,
+        saved(bot.proposals.callback),
         pattern=r"^g:(?:(?:send|cancel|back):[0-9a-f]{10}|(?:approve|reject):[0-9]+)$",
     ))
     app.add_error_handler(report_error)

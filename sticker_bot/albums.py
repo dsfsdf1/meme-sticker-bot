@@ -9,9 +9,10 @@ from telegram.error import BadRequest, TelegramError
 
 from .images import CAPTION_LIMIT, COLORS, ImageError, caption_font, cutout_photo, open_photo, photo_in_frame, render
 from .library import Library
+from .persistence import SavedDrafts
 from .packs import MAX_TITLE, new_pack_name, owned_packs, pack_url, save_many
 from .photos import MAX_PHOTO_BYTES, photo_bytes
-from .state import Draft, Drafts, Preferences, record_edit, restore_edit
+from .state import Draft, Preferences, record_edit, restore_edit
 from .navigation import back_keyboard, color_keyboard, history_buttons, home_button, position_keyboard, refresh_options
 
 MAX_PHOTOS = 8
@@ -81,7 +82,7 @@ class Albums:
         self.preferences = preferences
         self.show_pack = show_pack
         self.library = library
-        self.sessions: Drafts[Album] = Drafts(capacity=8)
+        self.sessions = SavedDrafts(preferences.path, "albums", capacity=8)
 
     async def start(self, message, user_id: int) -> Album:
         existing = self.sessions.get(user_id)

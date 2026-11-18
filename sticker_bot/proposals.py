@@ -11,7 +11,8 @@ from .images import CAPTION_LIMIT, ImageError
 from .library import Library
 from .packs import pack_url
 from .photos import photo_bytes
-from .state import Drafts, Preferences
+from .persistence import SavedDrafts
+from .state import Preferences
 from .navigation import back_keyboard, home_button
 
 
@@ -26,8 +27,8 @@ class Proposals:
     def __init__(self, library: Library, preferences: Preferences):
         self.library = library
         self.preferences = preferences
-        self.targets: Drafts[int] = Drafts()
-        self.previews: Drafts[Suggestion] = Drafts(capacity=8)
+        self.targets = SavedDrafts(preferences.path, "proposal_targets")
+        self.previews = SavedDrafts(preferences.path, "proposal_previews", capacity=8)
 
     def cancel(self, user_id: int) -> None:
         self.targets.discard(user_id)
