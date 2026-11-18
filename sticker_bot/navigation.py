@@ -39,3 +39,19 @@ def history_buttons(prefix: str, draft) -> list[Button]:
     if draft.redo:
         buttons.append(Button("↷ Повторить правку", callback_data=f"{prefix}redo"))
     return buttons
+
+
+async def refresh_options(query, draft, prefix: str, action: str, back: str) -> None:
+    from telegram.error import TelegramError
+
+    if action.startswith("color:"):
+        keyboard = color_keyboard(prefix, draft.color, back)
+    elif action.startswith(("position:", "gap:")):
+        keyboard = position_keyboard(prefix, draft, back)
+    else:
+        return
+    try:
+        await query.edit_message_reply_markup(reply_markup=keyboard)
+    except TelegramError:
+        # The new sticker has already been sent. A cosmetic refresh can be retried.
+        pass

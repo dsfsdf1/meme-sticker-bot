@@ -1,7 +1,6 @@
 import asyncio
 from dataclasses import replace
 from pathlib import Path
-from secrets import token_hex
 import logging
 
 from PIL import Image, UnidentifiedImageError
@@ -16,7 +15,7 @@ from .packs import DEFAULT_TITLE, MAX_TITLE, find_pack, new_pack_name, owned_pac
 from .proposals import Proposals
 from .photos import photo_bytes
 from .state import Draft, Drafts, Preferences, record_edit, restore_edit
-from .navigation import back_keyboard, color_keyboard, history_buttons, home_button, position_keyboard
+from .navigation import back_keyboard, color_keyboard, history_buttons, home_button, position_keyboard, refresh_options
 
 LOG = logging.getLogger(__name__)
 TEMPLATES = ("Я всё понял", "Это база", "Когда уже пятница?")
@@ -116,7 +115,7 @@ class StickerBot:
         preview = await asyncio.to_thread(
             render, draft.subject, draft.color, draft.caption, draft.caption_position, draft.caption_gap,
         )
-        draft = replace(draft, preview=preview, revision=token_hex(6), uploaded_id=None, waiting_text=False)
+        draft = replace(draft, preview=preview, uploaded_id=None, waiting_text=False)
 
         def button(label: str, action: str) -> Button:
             return Button(label, callback_data=f"d:{draft.revision}:{action}")
@@ -423,6 +422,10 @@ class StickerBot:
             await self.show_preview(message, user_id, replace(draft, color=action.split(":")[1]))
         elif action.startswith("template:"):
             await self.show_preview(message, user_id, replace(draft, caption=TEMPLATES[int(action.split(":")[1])]))
+
+        current = self.drafts.get(user_id)
+        if current:
+            await refresh_options(query, current, f"d:{revision}:", action, f"d:{revision}:back")
 
 
     async def save_one(self, message, bot, user_id: int, draft: Draft, name: str, title: str) -> bool:

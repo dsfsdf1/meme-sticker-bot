@@ -59,7 +59,7 @@ def test_single_sticker_back_undo_redo_and_cancel_name(tmp_path):
 
     async def press(action):
         draft = app.drafts.get(42)
-        update.callback_query = NS(data=f"d:{draft.revision}:{action}", answer=AsyncMock())
+        update.callback_query = NS(data=f"d:{draft.revision}:{action}", answer=AsyncMock(), edit_message_reply_markup=AsyncMock())
         await app.callback(update, context)
 
     async def scenario():
@@ -105,7 +105,7 @@ def test_album_navigation_history_restore_and_cancel_input(tmp_path):
     app.albums.sessions.put(42, album)
 
     async def press(action):
-        update.callback_query = NS(data=f"a:{album.revision}:{action}", answer=AsyncMock())
+        update.callback_query = NS(data=f"a:{album.revision}:{action}", answer=AsyncMock(), edit_message_reply_markup=AsyncMock())
         await app.albums.callback(update, NS(bot=NS(username="ExampleBot")))
 
     async def scenario():
@@ -134,5 +134,64 @@ def test_album_navigation_history_restore_and_cancel_input(tmp_path):
         assert app.albums.sessions.get(42) is album
         await press("resume")
         assert len(album.frames) == 2
+
+    asyncio.run(scenario())
+
+
+def test_one_layout_menu_accepts_multiple_choices_and_back(tmp_path):
+    app = StickerBot(Preferences(tmp_path / "state.sqlite3"))
+    message = NS(chat=NS(type="private"), reply_text=AsyncMock(), reply_sticker=AsyncMock())
+    context = NS(bot=NS(username="ExampleBot"))
+    user = NS(id=42)
+    queries = []
+
+    async def scenario():
+        await app.show_preview(message, 42, Draft(Image.new("RGBA", (50, 70), "red"), "white", "Это база"))
+        revision = app.drafts.get(42).revision
+        for action in ("layout", "position:top", "gap:24", "position:bottom", "back", "color:none", "undo", "redo"):
+            query = NS(data=f"d:{revision}:{action}", answer=AsyncMock(), edit_message_reply_markup=AsyncMock())
+            queries.append(query)
+            await app.callback(NS(callback_query=query, effective_user=user, effective_message=message), context)
+        draft = app.drafts.get(42)
+        assert draft.revision == revision
+        assert (draft.caption_position, draft.caption_gap, draft.color) == ("bottom", 24, "none")
+        assert all(not query.answer.call_args.kwargs.get("show_alert") for query in queries)
+
+        await app.show_preview(message, 42, Draft(Image.new("RGBA", (20, 30), "blue"), "white"), remember=False)
+        stale = NS(data=f"d:{revision}:color:pink", answer=AsyncMock(), edit_message_reply_markup=AsyncMock())
+        await app.callback(NS(callback_query=stale, effective_user=user, effective_message=message), context)
+        assert stale.answer.call_args.kwargs["show_alert"]
+        assert app.drafts.get(42).color == "white"
+
+    asyncio.run(scenario())
+
+
+def test_album_menu_remains_valid_for_edits_but_not_another_frame(tmp_path):
+    app = StickerBot(Preferences(tmp_path / "state.sqlite3"))
+    message = NS(chat=NS(type="private"), reply_text=AsyncMock(), reply_sticker=AsyncMock(), reply_photo=AsyncMock())
+    photo = Image.new("RGBA", (30, 50), "red")
+    draft = Draft(photo, "white", preview=render(photo, "white"))
+    album = Album(collecting=False, frames=[Frame(photo, draft), Frame(photo, replace(draft))])
+    app.albums.sessions.put(42, album)
+    user = NS(id=42)
+    context = NS(bot=NS(username="ExampleBot"))
+
+    async def press(revision, action):
+        query = NS(data=f"a:{revision}:{action}", answer=AsyncMock(), edit_message_reply_markup=AsyncMock())
+        await app.albums.callback(NS(callback_query=query, effective_user=user, effective_message=message), context)
+        return query
+
+    async def scenario():
+        await app.albums.edit(message, album, 0)
+        menu_revision = album.revision
+        for action in ("layout", "position:top", "gap:24", "back", "color:none", "undo", "redo"):
+            query = await press(menu_revision, action)
+            assert not query.answer.call_args.kwargs.get("show_alert")
+        assert (album.frames[0].draft.caption_position, album.frames[0].draft.caption_gap) == ("top", 24)
+        await press(menu_revision, "edit:1")
+        assert album.revision != menu_revision
+        stale = await press(menu_revision, "color:pink")
+        assert stale.answer.call_args.kwargs["show_alert"]
+        assert album.frames[1].draft.color == "white"
 
     asyncio.run(scenario())

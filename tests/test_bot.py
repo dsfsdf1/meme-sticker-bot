@@ -43,7 +43,7 @@ def test_photo_custom_caption_template_color_and_stale_buttons(tmp_path, monkeyp
     monkeypatch.setattr("sticker_bot.bot.cutout", lambda data: Image.new("RGBA", (20, 30), "green"))
 
     async def press(action, draft):
-        query = NS(data=f"d:{draft.revision}:{action}", answer=AsyncMock())
+        query = NS(data=f"d:{draft.revision}:{action}", answer=AsyncMock(), edit_message_reply_markup=AsyncMock())
         await app.callback(NS(callback_query=query, effective_user=user, effective_message=message), None)
         return query
 
@@ -61,14 +61,16 @@ def test_photo_custom_caption_template_color_and_stale_buttons(tmp_path, monkeyp
         await app.text(update, None)
         second = app.drafts.get(42)
         assert second.caption == "Ну привет!"
-        stale = await press("template:0", first)
-        assert stale.answer.call_args.kwargs["show_alert"]
-        await press("template:0", second)
+        # An earlier menu still edits the same photo.
+        await press("template:0", first)
         third = app.drafts.get(42)
         assert third.caption == TEMPLATES[0]
         await press("color:pink", third)
         assert app.drafts.get(42).color == "pink"
         assert preferences.color(42) == "blue"
+        await app.photo(update, None)
+        stale = await press("template:0", first)
+        assert stale.answer.call_args.kwargs["show_alert"]
 
     asyncio.run(scenario())
-    assert message.reply_sticker.await_count == 4
+    assert message.reply_sticker.await_count == 5

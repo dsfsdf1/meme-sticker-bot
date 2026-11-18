@@ -36,7 +36,7 @@ def test_album_edit_remove_and_create(tmp_path: Path, monkeypatch):
     async def button(action, revision=None):
         album = app.albums.sessions.get(user.id)
         update.callback_query = SimpleNamespace(
-            data=f"a:{revision or album.revision}:{action}", answer=AsyncMock(),
+            data=f"a:{revision or album.revision}:{action}", answer=AsyncMock(), edit_message_reply_markup=AsyncMock(),
         )
         await app.albums.callback(update, context)
 

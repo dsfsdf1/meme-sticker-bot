@@ -12,7 +12,7 @@ from .library import Library
 from .packs import MAX_TITLE, new_pack_name, owned_packs, pack_url, save_many
 from .photos import MAX_PHOTO_BYTES, photo_bytes
 from .state import Draft, Drafts, Preferences, record_edit, restore_edit
-from .navigation import back_keyboard, color_keyboard, history_buttons, home_button, position_keyboard
+from .navigation import back_keyboard, color_keyboard, history_buttons, home_button, position_keyboard, refresh_options
 
 MAX_PHOTOS = 8
 MIN_PHOTOS = 3
@@ -32,6 +32,7 @@ class Album:
     collecting: bool = True
     waiting: str | None = None
     index: int = 0
+    active_frame: int | None = None
     title: str | None = None
     target: str | None = None
     removed: list[tuple[int, Frame]] = field(default_factory=list)
@@ -174,6 +175,7 @@ class Albums:
 
     async def overview(self, message, album: Album) -> None:
         album.waiting = None
+        album.active_frame = None
         album.revision = token_hex(5)
         buttons = [self.button(album, str(index + 1), f"edit:{index}") for index in range(len(album.frames))]
         keys = [buttons[offset:offset + 4] for offset in range(0, len(buttons), 4)]
@@ -191,9 +193,11 @@ class Albums:
         )
 
     async def edit(self, message, album: Album, index: int) -> None:
+        if album.active_frame != index:
+            album.revision = token_hex(5)
+        album.active_frame = index
         album.index = index
         album.waiting = None
-        album.revision = token_hex(5)
         def button(text: str, action: str) -> Button:
             return self.button(album, text, action)
 
@@ -385,3 +389,10 @@ class Albums:
                 await message.reply_text("На этом кадре объект не выделился. Попробуйте «Фото в рамке».", reply_markup=back_keyboard(f"a:{album.revision}:back", "К редактору"))
                 return
             await self.render_edit(message, album, replace(frame.draft, subject=subject))
+
+
+        if not album.collecting and album.title is None and album.active_frame is not None:
+            await refresh_options(
+                query, album.frames[album.index].draft,
+                f"a:{album.revision}:", action, f"a:{album.revision}:back",
+            )
